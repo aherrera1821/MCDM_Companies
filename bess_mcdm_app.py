@@ -2,173 +2,205 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# ------------- App config -------------
-st.set_page_config(
-    page_title="BESS – AI/Data Center MCDM",
-    layout="wide"
-)
-
-st.title("MCDM Tool - Portfolio Companies Overview")
+st.set_page_config(page_title="Companies MCDM for BESS", layout="wide")
+st.title("BESS Partner & Investment Attractiveness – MCDM Tool")
 
 st.markdown(
     """
-1. Upload the Excel file with company scores.
-2. Adjust the weights for each criterion.
-3. Review rankings by **company** and aggregated by **sector**.
+Upload one Excel file that contains a **Companies** sheet.
 """
 )
 
-# ------------- File upload -------------
-uploaded_file = st.file_uploader(
-    "Upload the Excel file (e.g. `bess_mcdm_companies.xlsx`)",
-    type=["xlsx"]
-)
-
-if uploaded_file is None:
-    st.info("⬆️ Upload the Excel file to begin.")
-    st.stop()
-
-# Load data
-try:
-    df = pd.read_excel(uploaded_file, sheet_name="Companies")
-except Exception as e:
-    st.error(f"Could not read `Companies` sheet: {e}")
-    st.stop()
-
-# Basic validation
-required_cols = [
-    "Company",
-    "Sector",
-    "AI_DC_Exposure_Score",
-    "BESS_Synergy_Technical",
-    "BESS_Synergy_Commercial",
-    "Growth_Outlook",
-    "Risk_Adjusted_Quality",
-]
-missing = [c for c in required_cols if c not in df.columns]
-if missing:
-    st.error(f"Missing required columns in Excel file: {missing}")
-    st.stop()
-
-# ------------- Criteria & weights -------------
-st.sidebar.header("MCDM Weights")
-
-criteria = {
-    "AI_DC_Exposure_Score": "AI / Data Center Exposure",
-    "BESS_Synergy_Technical": "Technical BESS Synergy",
-    "BESS_Synergy_Commercial": "Commercial BESS Synergy",
-    "Growth_Outlook": "Growth Outlook",
-    "Risk_Adjusted_Quality": "Risk-Adjusted Quality",
+# ---------------- Helpers ----------------
+OLD_SCHEMA = {
+    "name": "Original schema (AI/DC exposure)",
+    "criteria": [
+        "AI_DC_Exposure_Score",
+        "BESS_Synergy_Technical",
+        "BESS_Synergy_Commercial",
+        "Growth_Outlook",
+        "Risk_Adjusted_Quality",
+    ],
 }
 
-weights = {}
-for col, label in criteria.items():
-    weights[col] = st.sidebar.slider(
-        label,
-        min_value=0.0,
-        max_value=5.0,
-        value=3.0,  # default
-        step=0.1,
-    )
+NEW_SCHEMA = {
+    "name": "New schema (Sector Growth + BESS synergy)",
+    "criteria": [
+        "Sector_Growth",
+        "BESS_Technical_Synergy",
+        "BESS_Commercial_Synergy",
+        "Company_Growth",
+        "Risk_Adjusted_Score",
+    ],
+}
 
-weight_values = np.array(list(weights.values()))
-if weight_values.sum() == 0:
-    st.warning("All weights are zero. Increase at least one weight to see rankings.")
+def load_companies_sheet(xlsx_file) -> pd.DataFrame:
+    df = pd.read_excel(xlsx_file, sheet_name="Companies")
+    # normalize common fields
+    if "Sector" not in df.columns:
+        df["Sector"] = "Unknown"
+    if "Company" not in df.columns:
+        raise ValueError("Missing required column: Company")
+    return df
+
+def detect_available_criteria(df: pd.DataFrame) -> list[str]:
+    # numeric-like columns excluding obvious non-criteria fields
+    exclude = {
+        "Company","Sector","Subsector","PublicPrivate","HQRegion","Scale","Notes",
+        "Initial_Overall_Score","Overall_Score","Overall_Index_0_100","Rank","Source_File"
+    }
+    cols = []
+    for c in df.columns:
+        if c in exclude:
+            continue
+        # accept if convertible to numeric for most rows
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().mean() >= 0.6:  # >=60% numeric values
+            cols.append(c)
+    return cols
+
+def normalize_series(s: pd.Series, method: str) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    if method == "assume_1_to_5":
+        return (s / 5.0).clip(0, 1)
+    elif method == "min_max":
+        mn, mx = s.min(skipna=True), s.max(skipna=True)
+        if pd.isna(mn) or pd.isna(mx) or mx == mn:
+            return pd.Series(np.nan, index=s.index)
+        return (s - mn) / (mx - mn)
+    else:  # auto
+        mx = s.max(skipna=True)
+        mn = s.min(skipna=True)
+        # If it looks like a 1–5 score, scale by 5; else min-max.
+        if (mn >= 0) and (mx <= 5):
+            return (s / 5.0).clip(0, 1)
+        return normalize_series(s, "min_max")
+
+# ---------------- Upload ----------------
+files = st.file_uploader(
+    "Upload one or more Excel files (.xlsx) with a Companies sheet",
+    type=["xlsx"],
+    accept_multiple_files=True
+)
+
+if not files:
+    st.info("Upload at least one Excel file to begin.")
     st.stop()
 
-# Normalized weights
-norm_weights = weight_values / weight_values.sum()
+dfs = []
+for f in files:
+    try:
+        df_i = load_companies_sheet(f)
+        df_i["Source_File"] = getattr(f, "name", "uploaded.xlsx")
+        dfs.append(df_i)
+    except Exception as e:
+        st.error(f"Failed to read {getattr(f, 'name', '')}: {e}")
+        st.stop()
 
-st.sidebar.markdown("**Normalized weights:**")
-for (col, label), w in zip(criteria.items(), norm_weights):
-    st.sidebar.markdown(f"- {label}: {w:.2f}")
+df = pd.concat(dfs, ignore_index=True)
 
-# ------------- Compute scores -------------
-score_cols = list(criteria.keys())
+# ---------------- Criteria selection ----------------
+st.sidebar.header("Criteria selection")
 
-# Ensure numeric
-for c in score_cols:
-    df[c] = pd.to_numeric(df[c], errors="coerce")
+available = detect_available_criteria(df)
 
-score_matrix = df[score_cols].to_numpy(dtype=float)
-# Simple scaling: assume all scores on similar scale (1–5). Normalize to 0–1.
-score_matrix_norm = score_matrix / 5.0
+has_old = all(c in df.columns for c in OLD_SCHEMA["criteria"])
+has_new = all(c in df.columns for c in NEW_SCHEMA["criteria"])
 
-overall_scores = (score_matrix_norm * norm_weights).sum(axis=1)
-df["Overall_Score"] = overall_scores
+preset_options = ["Custom (choose columns)"]
+if has_old:
+    preset_options.insert(0, OLD_SCHEMA["name"])
+if has_new:
+    preset_options.insert(0, NEW_SCHEMA["name"])
 
-# For convenience show as 0–100 index
-df["Overall_Index_0_100"] = (df["Overall_Score"] * 100).round(1)
+preset = st.sidebar.selectbox("Preset", preset_options)
 
-# ------------- Filters -------------
-st.sidebar.header("Filters")
-
-sectors = sorted(df["Sector"].dropna().unique())
-selected_sectors = st.sidebar.multiselect(
-    "Filter by Sector",
-    options=sectors,
-    default=sectors
-)
-
-filtered_df = df[df["Sector"].isin(selected_sectors)].copy()
-
-# ------------- Company rankings -------------
-st.subheader("Company Ranking")
-
-ranked = filtered_df.sort_values("Overall_Score", ascending=False).reset_index(drop=True)
-ranked["Rank"] = ranked.index + 1
-
-cols_to_show = [
-    "Rank",
-    "Company",
-    "Sector",
-    "Overall_Index_0_100",
-] + score_cols
-
-st.dataframe(
-    ranked[cols_to_show],
-    use_container_width=True,
-    hide_index=True
-)
-
-# ------------- Sector rankings -------------
-st.subheader("Sector Ranking (Average Score)")
-
-sector_scores = (
-    filtered_df
-    .groupby("Sector")["Overall_Score"]
-    .mean()
-    .sort_values(ascending=False)
-)
-
-sector_df = sector_scores.reset_index()
-sector_df["Overall_Index_0_100"] = (sector_df["Overall_Score"] * 100).round(1)
-
-st.dataframe(sector_df, use_container_width=True, hide_index=True)
-
-st.bar_chart(
-    sector_df.set_index("Sector")["Overall_Index_0_100"],
-    use_container_width=True
-)
-
-# ------------- Detail view -------------
-st.subheader("Compare Selected Companies")
-
-selected_companies = st.multiselect(
-    "Pick companies to compare (optional)",
-    options=list(ranked["Company"]),
-)
-
-if selected_companies:
-    comp_df = ranked[ranked["Company"].isin(selected_companies)]
-
-    st.write("### Detailed criteria comparison")
-    st.dataframe(
-        comp_df[["Company", "Sector", "Overall_Index_0_100"] + score_cols],
-        use_container_width=True,
-        hide_index=True
+if preset == OLD_SCHEMA["name"]:
+    criteria = OLD_SCHEMA["criteria"]
+elif preset == NEW_SCHEMA["name"]:
+    criteria = NEW_SCHEMA["criteria"]
+else:
+    criteria = st.sidebar.multiselect(
+        "Pick criteria columns",
+        options=sorted(available),
+        default=sorted([c for c in NEW_SCHEMA["criteria"] if c in available]) or sorted(available)[:5]
     )
 
-# ------------- Raw data -------------
-with st.expander("Show raw data from Excel"):
+if not criteria:
+    st.warning("Select at least one criterion.")
+    st.stop()
+
+# ---------------- Scaling options ----------------
+st.sidebar.header("Scaling")
+scale_method = st.sidebar.selectbox(
+    "Normalize criteria values",
+    options=[
+        ("auto", "Auto (1–5 → /5, else Min-Max)"),
+        ("assume_1_to_5", "Assume all criteria are 1–5 scores"),
+        ("min_max", "Min-Max normalize (0–1)"),
+    ],
+    format_func=lambda x: x[1]
+)[0]
+
+# ---------------- Weights ----------------
+st.sidebar.header("Weights")
+weights = []
+for c in criteria:
+    w = st.sidebar.slider(f"Weight: {c}", 0.0, 5.0, 3.0, 0.1)
+    weights.append(w)
+
+weights = np.array(weights, dtype=float)
+if weights.sum() == 0:
+    st.warning("All weights are zero. Increase at least one weight.")
+    st.stop()
+
+weights = weights / weights.sum()
+
+# ---------------- Filters ----------------
+st.sidebar.header("Filters")
+sectors = sorted(df["Sector"].dropna().unique())
+selected_sectors = st.sidebar.multiselect("Sectors", sectors, default=sectors)
+
+filtered = df[df["Sector"].isin(selected_sectors)].copy()
+
+# ---------------- Compute MCDM ----------------
+norm = pd.DataFrame(index=filtered.index)
+for c in criteria:
+    norm[c] = normalize_series(filtered[c], scale_method)
+
+# Drop rows with too many NaNs in selected criteria
+valid_mask = norm[criteria].notna().mean(axis=1) >= 0.6
+filtered = filtered[valid_mask].copy()
+norm = norm.loc[filtered.index].copy()
+
+overall = (norm[criteria].fillna(0).to_numpy() * weights).sum(axis=1)
+filtered["Overall_Score"] = overall
+filtered["Overall_Index_0_100"] = (filtered["Overall_Score"] * 100).round(1)
+
+# ---------------- Outputs ----------------
+st.subheader("Company Ranking")
+ranked = filtered.sort_values("Overall_Score", ascending=False).reset_index(drop=True)
+ranked["Rank"] = ranked.index + 1
+
+show_cols = ["Rank", "Company", "Sector", "Overall_Index_0_100", "Source_File"] + criteria
+st.dataframe(ranked[show_cols], use_container_width=True, hide_index=True)
+
+st.subheader("Sector Ranking (Average)")
+sector_df = (
+    ranked.groupby("Sector", as_index=False)["Overall_Score"]
+    .mean()
+    .sort_values("Overall_Score", ascending=False)
+)
+sector_df["Overall_Index_0_100"] = (sector_df["Overall_Score"] * 100).round(1)
+st.dataframe(sector_df[["Sector", "Overall_Index_0_100"]], use_container_width=True, hide_index=True)
+st.bar_chart(sector_df.set_index("Sector")["Overall_Index_0_100"], use_container_width=True)
+
+st.subheader("Compare Selected Companies")
+choices = st.multiselect("Select companies", options=list(ranked["Company"].unique()))
+if choices:
+    comp = ranked[ranked["Company"].isin(choices)]
+    st.dataframe(comp[["Company","Sector","Overall_Index_0_100","Source_File"] + criteria],
+                 use_container_width=True, hide_index=True)
+
+with st.expander("Show combined raw input table"):
     st.dataframe(df, use_container_width=True)
