@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 st.set_page_config(page_title="Companies MCDM for BESS", layout="wide")
-st.title("BESS Partner & Investment Attractiveness – MCDM Tool")
+st.title("Companies – MCDM Tool")
 
 st.markdown(
     """
